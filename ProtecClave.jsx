@@ -1,0 +1,866 @@
+/**
+ * ============================================================================
+ *  ProtecClave — Auditor & Generador de Seguridad
+ *  Proyecto universitario · UNFV · Ingeniería de Sistemas
+ *  Curso: Tecnología de Información y Comunicación (TIC)
+ * ----------------------------------------------------------------------------
+ *  Stack: React + Tailwind CSS + Lucide Icons + Three.js (WebGL nativo)
+ *  Todo el procesamiento ocurre EN MEMORIA, en el navegador del usuario.
+ *  Ninguna contraseña se envía a internet ni se guarda en disco.
+ *
+ *  Estructura del archivo:
+ *   1. Constantes (listas, colores, niveles de seguridad)
+ *   2. Lógica de ciberseguridad (evaluación, entropía, generador)
+ *   3. Componente Escena3D (núcleo criptográfico con Three.js)
+ *   4. Componentes de interfaz pequeños (Criterio, Métrica, Toast)
+ *   5. Componente principal <ProtecClave />
+ * ============================================================================
+ */
+
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import * as THREE from "three";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import {
+  Shield, ShieldCheck, ShieldAlert, Eye, EyeOff, Copy, Trash2, Sparkles,
+  Check, AlertTriangle, Moon, Sun, Lock, Clock, Cpu, Zap, RefreshCw, Info,
+} from "lucide-react";
+
+/* ============================================================================
+ * 1. CONSTANTES
+ * ========================================================================== */
+
+// Contraseñas más usadas (un atacante las prueba primero: "ataque de diccionario")
+const CONTRASENAS_COMUNES = [
+  "123456", "admin123", "qwerty", "password", "contraseña", "clave123", "iloveyou",
+];
+
+// Conjuntos de caracteres que usa el generador
+const MAYUSCULAS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const MINUSCULAS = "abcdefghijklmnopqrstuvwxyz";
+const DIGITOS = "0123456789";
+const SIMBOLOS = "!@#$%&*?-_";
+
+// Ejemplos rápidos para la exposición en vivo
+const EJEMPLOS = ["admin123", "Unfv2026", "K9#mP2$vL8@qR4!x"];
+
+/**
+ * Niveles de seguridad. Cada nivel define:
+ *  - color:     color Apple del sistema (núcleo 3D, barra, etiquetas)
+ *  - arco:      qué tan cerrados están los anillos 3D (1 = círculo completo)
+ *  - desorden:  qué tan desalineados están los anillos (0 = alineados)
+ *  - vibracion: intensidad del temblor del objeto 3D
+ *  - giro:      velocidad de rotación automática
+ */
+const NIVELES = {
+  vacio:    { id: "vacio",    etiqueta: "Sin evaluar", color: "#A1A1A6", arco: 0.85, desorden: 0.35, vibracion: 0,   giro: 0.003 },
+  muyDebil: { id: "muyDebil", etiqueta: "Muy débil",   color: "#FF3B30", arco: 0.45, desorden: 1,    vibracion: 1,   giro: 0.012 },
+  debil:    { id: "debil",    etiqueta: "Débil",       color: "#FF9500", arco: 0.6,  desorden: 0.75, vibracion: 0.5, giro: 0.010 },
+  moderada: { id: "moderada", etiqueta: "Moderada",    color: "#007AFF", arco: 0.85, desorden: 0.3,  vibracion: 0,   giro: 0.007 },
+  segura:   { id: "segura",   etiqueta: "Segura",      color: "#34C759", arco: 1,    desorden: 0,    vibracion: 0,   giro: 0.005 },
+};
+
+/* ============================================================================
+ * 2. LÓGICA DE CIBERSEGURIDAD
+ * ========================================================================== */
+
+/**
+ * Detecta secuencias obvias de 4 caracteres:
+ *  - ascendentes  (1234, abcd)
+ *  - descendentes (4321, dcba)
+ *  - repeticiones (aaaa, 1111)
+ * Compara los códigos numéricos (Unicode) de cada carácter.
+ */
+function tieneSecuencia(clave) {
+  const s = clave.toLowerCase();
+  for (let i = 0; i <= s.length - 4; i++) {
+    const c = [0, 1, 2, 3].map((k) => s.charCodeAt(i + k));
+    const ascendente  = c.every((v, k) => k === 0 || v - c[k - 1] === 1);
+    const descendente = c.every((v, k) => k === 0 || v - c[k - 1] === -1);
+    const repetida    = c.every((v) => v === c[0]);
+    if (ascendente || descendente || repetida) return true;
+  }
+  return false;
+}
+
+/** ¿Contiene alguna contraseña de la lista común? */
+function esComun(clave) {
+  const s = clave.toLowerCase();
+  return CONTRASENAS_COMUNES.some((p) => s.includes(p));
+}
+
+/**
+ * Convierte segundos en un texto entendible ("3 días", "Siglos"...).
+ */
+function formatearTiempo(segundos) {
+  const MIN = 60, HORA = 3600, DIA = 86400, MES = 2.63e6, ANIO = 3.156e7;
+  if (segundos < 1) return "Instantáneo";
+  if (segundos < MIN) return `${Math.round(segundos)} segundos`;
+  if (segundos < HORA) return `${Math.round(segundos / MIN)} minutos`;
+  if (segundos < DIA) return `${Math.round(segundos / HORA)} horas`;
+  if (segundos < MES) return `${Math.round(segundos / DIA)} días`;
+  if (segundos < ANIO) return `${Math.round(segundos / MES)} meses`;
+  if (segundos < ANIO * 100) return `${Math.round(segundos / ANIO)} años`;
+  if (segundos < ANIO * 1e5) return "Siglos";
+  if (segundos < ANIO * 1.38e10) return "Millones de años";
+  return "Más que la edad del universo";
+}
+
+/**
+ * Evalúa la contraseña y devuelve todo lo que la interfaz necesita.
+ *
+ * ENTROPÍA (bits) = longitud × log2(tamaño del alfabeto usado)
+ *   Ej: 12 caracteres con a-z, A-Z, 0-9 → 12 × log2(62) ≈ 71 bits
+ *
+ * TIEMPO DE DESCIFRADO = (2^entropía / 2) / velocidad del atacante
+ *   Se divide entre 2 porque, en promedio, se acierta a mitad de camino.
+ *   Velocidad supuesta: 10 mil millones de intentos/seg (GPU moderna offline).
+ */
+function evaluarClave(clave) {
+  const vacia = clave.length === 0;
+
+  const criterios = [
+    { id: "longitud", texto: "Mínimo 12 caracteres",              cumple: clave.length >= 12 },
+    { id: "mayus",    texto: "Letras mayúsculas (A-Z)",           cumple: /[A-Z]/.test(clave) },
+    { id: "minus",    texto: "Letras minúsculas (a-z)",           cumple: /[a-z]/.test(clave) },
+    { id: "numeros",  texto: "Números (0-9)",                     cumple: /[0-9]/.test(clave) },
+    { id: "simbolos", texto: "Caracteres especiales (!@#$%&*?-_)", cumple: /[^A-Za-z0-9\s]/.test(clave) },
+    {
+      id: "comun",
+      texto: "No es común ni tiene secuencias (1234, abcd, aaaa)",
+      cumple: !vacia && !esComun(clave) && !tieneSecuencia(clave),
+    },
+  ];
+
+  const cumplidos = criterios.filter((c) => c.cumple).length;
+  const porcentaje = Math.round((cumplidos / criterios.length) * 100);
+
+  // Nivel según el porcentaje (rangos pedidos en el enunciado)
+  let nivel = NIVELES.vacio;
+  if (!vacia) {
+    if (porcentaje === 100) nivel = NIVELES.segura;
+    else if (porcentaje >= 67) nivel = NIVELES.moderada;
+    else if (porcentaje >= 50) nivel = NIVELES.debil;
+    else nivel = NIVELES.muyDebil;
+  }
+
+  // Tamaño del alfabeto que realmente usa la contraseña
+  let alfabeto = 0;
+  if (/[a-z]/.test(clave)) alfabeto += 26;
+  if (/[A-Z]/.test(clave)) alfabeto += 26;
+  if (/[0-9]/.test(clave)) alfabeto += 10;
+  if (/[^A-Za-z0-9]/.test(clave)) alfabeto += 32;
+
+  let entropia = alfabeto > 0 ? clave.length * Math.log2(alfabeto) : 0;
+  // Si es común o predecible, un diccionario la rompe casi al instante
+  if (!vacia && (esComun(clave) || tieneSecuencia(clave))) entropia = Math.min(entropia, 20);
+
+  const INTENTOS_POR_SEGUNDO = 1e10;
+  const segundos = Math.pow(2, entropia) / 2 / INTENTOS_POR_SEGUNDO;
+
+  return {
+    criterios,
+    porcentaje,
+    nivel,
+    entropia: Math.round(entropia),
+    tiempo: vacia ? "—" : formatearTiempo(segundos),
+  };
+}
+
+/**
+ * Número aleatorio criptográficamente seguro en [0, max).
+ * Usa window.crypto.getRandomValues() (equivalente web al módulo `secrets` de Python).
+ * "Muestreo por rechazo": descarta valores que causarían sesgo con el módulo (%).
+ */
+function enteroSeguro(max) {
+  const buffer = new Uint32Array(1);
+  const limite = Math.floor(0x100000000 / max) * max;
+  let x;
+  do {
+    window.crypto.getRandomValues(buffer);
+    x = buffer[0];
+  } while (x >= limite);
+  return x % max;
+}
+
+/**
+ * Genera una contraseña segura:
+ *  1) Garantiza al menos 1 carácter de cada grupo elegido.
+ *  2) Rellena el resto con caracteres aleatorios de todos los grupos.
+ *  3) Mezcla con Fisher–Yates usando el azar criptográfico.
+ *  4) Si por azar sale una secuencia (ej. "abcd"), vuelve a generar.
+ */
+function generarClave(longitud, { numeros, simbolos }) {
+  const grupos = [MAYUSCULAS, MINUSCULAS];
+  if (numeros) grupos.push(DIGITOS);
+  if (simbolos) grupos.push(SIMBOLOS);
+  const todos = grupos.join("");
+
+  for (let intento = 0; intento < 50; intento++) {
+    const chars = grupos.map((g) => g[enteroSeguro(g.length)]);
+    while (chars.length < longitud) chars.push(todos[enteroSeguro(todos.length)]);
+
+    for (let i = chars.length - 1; i > 0; i--) {
+      const j = enteroSeguro(i + 1);
+      [chars[i], chars[j]] = [chars[j], chars[i]];
+    }
+    const clave = chars.join("");
+    if (!tieneSecuencia(clave) && !esComun(clave)) return clave;
+  }
+  return todos.slice(0, longitud); // nunca debería llegar aquí
+}
+
+/** Copia texto al portapapeles (con plan B para navegadores antiguos). */
+async function copiarTexto(texto) {
+  try {
+    await navigator.clipboard.writeText(texto);
+    return true;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = texto;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  }
+}
+
+/* ============================================================================
+ * 3. ESCENA 3D — Núcleo criptográfico con anillos (Three.js)
+ * ----------------------------------------------------------------------------
+ *  - Núcleo: icosaedro metálico (forma geométrica facetada).
+ *  - 3 anillos (toros) que se ABREN (arco incompleto) y DESALINEAN cuando la
+ *    clave es débil, y se CIERRAN y ALINEAN formando un escudo cuando es segura.
+ *  - El usuario puede girar el modelo arrastrando con mouse o dedo.
+ * ========================================================================== */
+
+function Escena3D({ nivel }) {
+  const contenedorRef = useRef(null);
+  // Guardamos el nivel objetivo en una ref para que el bucle de animación
+  // lo lea sin tener que reiniciar toda la escena en cada tecla.
+  const objetivoRef = useRef(nivel);
+
+  useEffect(() => {
+    objetivoRef.current = nivel;
+  }, [nivel]);
+
+  useEffect(() => {
+    const contenedor = contenedorRef.current;
+    if (!contenedor) return;
+
+    // --- Renderizador, escena y cámara -------------------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    contenedor.appendChild(renderer.domElement);
+    renderer.domElement.style.touchAction = "none"; // permite arrastrar en móvil
+
+    const escena = new THREE.Scene();
+    const camara = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+    camara.position.set(0, 0, 8);
+
+    // Entorno de reflejos (da el brillo metálico estilo Apple)
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const entorno = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    escena.environment = entorno;
+
+    // Luces de apoyo
+    escena.add(new THREE.AmbientLight(0xffffff, 0.4));
+    const luz = new THREE.DirectionalLight(0xffffff, 1.2);
+    luz.position.set(3, 4, 5);
+    escena.add(luz);
+
+    // Grupo raíz (lo que el usuario rota con el mouse)
+    const grupo = new THREE.Group();
+    escena.add(grupo);
+
+    // --- Núcleo ------------------------------------------------------------
+    const materialNucleo = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(NIVELES.vacio.color),
+      metalness: 0.85,
+      roughness: 0.18,
+      clearcoat: 1,
+      clearcoatRoughness: 0.1,
+      transparent: true,
+      opacity: 0.92,
+      flatShading: true,
+      emissive: new THREE.Color("#000000"),
+    });
+    const nucleo = new THREE.Mesh(new THREE.IcosahedronGeometry(0.95, 1), materialNucleo);
+    grupo.add(nucleo);
+
+    // Malla de alambre sobre el núcleo (efecto "circuito criptográfico")
+    const alambre = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.02, 1),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.18 })
+    );
+    grupo.add(alambre);
+
+    // --- Anillos -----------------------------------------------------------
+    const materialAnillo = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(NIVELES.vacio.color),
+      metalness: 0.95,
+      roughness: 0.12,
+      clearcoat: 1,
+      transparent: true,
+      opacity: 0.9,
+      emissive: new THREE.Color("#000000"),
+    });
+
+    const datosAnillos = [
+      { radio: 1.55, grosor: 0.07, desfase: new THREE.Euler(1.1, 0.4, 0),  vel: 0.9 },
+      { radio: 1.95, grosor: 0.06, desfase: new THREE.Euler(-0.6, 1.2, 0), vel: -0.7 },
+      { radio: 2.35, grosor: 0.05, desfase: new THREE.Euler(0.3, -1.0, 0), vel: 0.5 },
+    ];
+    let arcoActual = NIVELES.vacio.arco;
+    const crearGeometriaAnillo = (d, arco) =>
+      new THREE.TorusGeometry(d.radio, d.grosor, 24, 160, Math.PI * 2 * arco);
+
+    const anillos = datosAnillos.map((d) => {
+      const malla = new THREE.Mesh(crearGeometriaAnillo(d, arcoActual), materialAnillo);
+      grupo.add(malla);
+      return { malla, ...d, giroPropio: Math.random() * Math.PI * 2 };
+    });
+
+    // --- Interacción: arrastrar para rotar ---------------------------------
+    let arrastrando = false;
+    let ultimoX = 0, ultimoY = 0;
+    let velX = 0, velY = 0;        // inercia
+    let rotUsuarioX = 0.25, rotUsuarioY = 0;
+
+    const alPresionar = (e) => {
+      arrastrando = true;
+      ultimoX = e.clientX;
+      ultimoY = e.clientY;
+      renderer.domElement.setPointerCapture(e.pointerId);
+    };
+    const alMover = (e) => {
+      if (!arrastrando) return;
+      velY = (e.clientX - ultimoX) * 0.008;
+      velX = (e.clientY - ultimoY) * 0.008;
+      ultimoX = e.clientX;
+      ultimoY = e.clientY;
+    };
+    const alSoltar = () => (arrastrando = false);
+
+    const lienzo = renderer.domElement;
+    lienzo.addEventListener("pointerdown", alPresionar);
+    lienzo.addEventListener("pointermove", alMover);
+    lienzo.addEventListener("pointerup", alSoltar);
+    lienzo.addEventListener("pointerleave", alSoltar);
+
+    // --- Ajuste de tamaño (responsive) -------------------------------------
+    const ajustarTamano = () => {
+      const { clientWidth: w, clientHeight: h } = contenedor;
+      if (!w || !h) return;
+      renderer.setSize(w, h, false);
+      lienzo.style.width = "100%";
+      lienzo.style.height = "100%";
+      camara.aspect = w / h;
+      camara.updateProjectionMatrix();
+    };
+    const observador = new ResizeObserver(ajustarTamano);
+    observador.observe(contenedor);
+    ajustarTamano();
+
+    // --- Bucle de animación ------------------------------------------------
+    const colorObjetivo = new THREE.Color();
+    const negro = new THREE.Color("#000000");
+    const emisivoObjetivo = new THREE.Color();
+    let tiempo = 0;
+    let idFrame;
+
+    const animar = () => {
+      idFrame = requestAnimationFrame(animar);
+      tiempo += 0.016;
+      const obj = objetivoRef.current;
+
+      // 1) Color suave hacia el color del nivel (interpolación "lerp")
+      colorObjetivo.set(obj.color);
+      materialNucleo.color.lerp(colorObjetivo, 0.06);
+      materialAnillo.color.lerp(colorObjetivo, 0.06);
+      const brillo = obj.id === "segura" ? 0.35 : obj.id === "vacio" ? 0 : 0.15;
+      emisivoObjetivo.copy(colorObjetivo).lerp(negro, 1 - brillo);
+      materialNucleo.emissive.lerp(emisivoObjetivo, 0.06);
+      materialAnillo.emissive.lerp(emisivoObjetivo, 0.06);
+
+      // 2) Abrir/cerrar anillos (solo se reconstruye la geometría si cambia)
+      if (Math.abs(arcoActual - obj.arco) > 0.002) {
+        arcoActual += (obj.arco - arcoActual) * 0.08;
+        anillos.forEach((a) => {
+          a.malla.geometry.dispose();
+          a.malla.geometry = crearGeometriaAnillo(a, arcoActual);
+        });
+      }
+
+      // 3) Alinear/desalinear anillos según el "desorden" del nivel
+      anillos.forEach((a) => {
+        const r = a.malla.rotation;
+        r.x += (a.desfase.x * obj.desorden - r.x) * 0.05;
+        r.y += (a.desfase.y * obj.desorden - r.y) * 0.05;
+        // Giro propio: rápido si es débil, casi quieto si es segura
+        a.giroPropio += a.vel * 0.02 * (obj.desorden + 0.08);
+        r.z = a.giroPropio;
+      });
+
+      // 4) Vibración sutil cuando es débil
+      const v = obj.vibracion * 0.035;
+      grupo.position.set((Math.random() - 0.5) * v, (Math.random() - 0.5) * v, 0);
+
+      // 5) Rotación: automática + la del usuario (con inercia)
+      if (!arrastrando) {
+        velX *= 0.94;
+        velY *= 0.94;
+      }
+      rotUsuarioX = Math.max(-1.2, Math.min(1.2, rotUsuarioX + velX));
+      rotUsuarioY += velY + obj.giro;
+      grupo.rotation.x = rotUsuarioX;
+      grupo.rotation.y = rotUsuarioY;
+
+      // 6) "Respiración" del núcleo cuando es segura
+      const pulso = obj.id === "segura" ? 1 + Math.sin(tiempo * 2) * 0.03 : 1;
+      nucleo.scale.setScalar(pulso);
+      alambre.rotation.y -= 0.003;
+
+      renderer.render(escena, camara);
+    };
+    animar();
+
+    // --- Limpieza al desmontar (evita fugas de memoria) --------------------
+    return () => {
+      cancelAnimationFrame(idFrame);
+      observador.disconnect();
+      lienzo.removeEventListener("pointerdown", alPresionar);
+      lienzo.removeEventListener("pointermove", alMover);
+      lienzo.removeEventListener("pointerup", alSoltar);
+      lienzo.removeEventListener("pointerleave", alSoltar);
+      anillos.forEach((a) => a.malla.geometry.dispose());
+      nucleo.geometry.dispose();
+      alambre.geometry.dispose();
+      materialNucleo.dispose();
+      materialAnillo.dispose();
+      alambre.material.dispose();
+      entorno.dispose();
+      pmrem.dispose();
+      renderer.dispose();
+      if (lienzo.parentNode) lienzo.parentNode.removeChild(lienzo);
+    };
+  }, []);
+
+  return (
+    <div
+      ref={contenedorRef}
+      className="w-full h-full cursor-grab active:cursor-grabbing select-none"
+      aria-label="Modelo 3D del núcleo criptográfico. Arrastra para rotarlo."
+    />
+  );
+}
+
+/* ============================================================================
+ * 4. COMPONENTES PEQUEÑOS DE INTERFAZ
+ * ========================================================================== */
+
+// Curva tipo "spring" (rebote suave) usada en las transiciones
+const SPRING = "transition-all duration-500 [transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)]";
+
+/** Una fila de criterio con su ícono animado (check verde o alerta). */
+function Criterio({ texto, cumple, vacia, oscuro }) {
+  const colorIcono = cumple ? "bg-[#34C759]" : vacia ? (oscuro ? "bg-white/15" : "bg-black/10") : "bg-[#FF9500]";
+  return (
+    <li className="flex items-center gap-3 py-1.5">
+      <span
+        className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-white ${colorIcono} ${SPRING} ${
+          cumple ? "scale-100" : "scale-90"
+        }`}
+      >
+        {cumple ? <Check size={14} strokeWidth={3} /> : <AlertTriangle size={12} strokeWidth={2.5} />}
+      </span>
+      <span
+        className={`text-sm transition-colors duration-300 ${
+          cumple ? (oscuro ? "text-white" : "text-[#1D1D1F]") : oscuro ? "text-white/50" : "text-[#86868B]"
+        }`}
+      >
+        {texto}
+      </span>
+    </li>
+  );
+}
+
+/** Tarjeta pequeña de métrica (entropía, tiempo...). */
+function Metrica({ icono: Icono, titulo, valor, subtitulo, oscuro }) {
+  return (
+    <div className={`rounded-2xl p-4 ${oscuro ? "bg-white/5" : "bg-black/[0.03]"}`}>
+      <div className={`flex items-center gap-2 text-xs font-medium ${oscuro ? "text-white/50" : "text-[#86868B]"}`}>
+        <Icono size={14} /> {titulo}
+      </div>
+      <div className={`mt-1 text-xl font-semibold tracking-tight ${oscuro ? "text-white" : "text-[#1D1D1F]"}`}>{valor}</div>
+      {subtitulo && <div className={`text-[11px] ${oscuro ? "text-white/40" : "text-[#86868B]"}`}>{subtitulo}</div>}
+    </div>
+  );
+}
+
+/** Notificación flotante estilo "Dynamic Island" del iPhone. */
+function DynamicIsland({ mensaje, visible }) {
+  return (
+    <div className="pointer-events-none fixed inset-x-0 top-4 z-50 flex justify-center">
+      <div
+        className={`flex items-center gap-2 overflow-hidden rounded-full bg-black text-white shadow-2xl ${SPRING} ${
+          visible ? "h-11 max-w-xs px-5 opacity-100" : "h-8 max-w-[7rem] px-3 opacity-0 -translate-y-2"
+        }`}
+      >
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[#34C759]">
+          <Check size={12} strokeWidth={3} />
+        </span>
+        <span className="whitespace-nowrap text-sm font-medium">{mensaje}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 5. COMPONENTE PRINCIPAL
+ * ========================================================================== */
+
+export default function ProtecClave() {
+  // --- Estado de la aplicación ---------------------------------------------
+  const [clave, setClave] = useState("");
+  const [mostrar, setMostrar] = useState(false);
+  const [oscuro, setOscuro] = useState(false);
+  const [longitud, setLongitud] = useState(16);
+  const [usarNumeros, setUsarNumeros] = useState(true);
+  const [usarSimbolos, setUsarSimbolos] = useState(true);
+  const [toast, setToast] = useState({ visible: false, mensaje: "" });
+  const temporizadorToast = useRef(null);
+
+  // Evaluación en tiempo real: se recalcula solo cuando cambia la clave
+  const resultado = useMemo(() => evaluarClave(clave), [clave]);
+  const { criterios, porcentaje, nivel, entropia, tiempo } = resultado;
+  const vacia = clave.length === 0;
+
+  // --- Acciones ------------------------------------------------------------
+  const mostrarToast = useCallback((mensaje) => {
+    clearTimeout(temporizadorToast.current);
+    setToast({ visible: true, mensaje });
+    temporizadorToast.current = setTimeout(() => setToast((t) => ({ ...t, visible: false })), 1800);
+  }, []);
+
+  useEffect(() => () => clearTimeout(temporizadorToast.current), []);
+
+  const copiar = async () => {
+    if (vacia) return;
+    const ok = await copiarTexto(clave);
+    mostrarToast(ok ? "Copiado al portapapeles" : "No se pudo copiar");
+  };
+
+  const generar = () => {
+    setClave(generarClave(longitud, { numeros: usarNumeros, simbolos: usarSimbolos }));
+    setMostrar(true);
+    mostrarToast("Clave segura generada");
+  };
+
+  // --- Estilos según el tema (claro / oscuro) ------------------------------
+  const tarjeta = `rounded-3xl backdrop-blur-2xl ${
+    oscuro
+      ? "bg-[#1C1C1E]/70 border border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.4),0_12px_40px_rgba(0,0,0,0.5)]"
+      : "bg-white/60 border border-white/40 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_rgba(0,0,0,0.06),0_24px_48px_rgba(0,0,0,0.04)]"
+  }`;
+  const textoPrincipal = oscuro ? "text-white" : "text-[#1D1D1F]";
+  const textoSecundario = oscuro ? "text-white/50" : "text-[#86868B]";
+  const botonSecundario = `flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-sm font-medium transition-all active:scale-95 ${
+    oscuro ? "bg-white/10 text-white hover:bg-white/15" : "bg-black/5 text-[#1D1D1F] hover:bg-black/10"
+  }`;
+
+  const IconoNivel = nivel.id === "segura" ? ShieldCheck : nivel.id === "vacio" ? Shield : ShieldAlert;
+
+  return (
+    <div
+      className={`relative min-h-screen w-full overflow-hidden transition-colors duration-700 ${
+        oscuro ? "bg-black" : "bg-[#F5F5F7]"
+      }`}
+      style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, "Segoe UI", sans-serif' }}
+    >
+      {/* Manchas de color difuminadas al fondo: hacen visible el efecto vidrio
+          y cambian de color con el nivel de seguridad */}
+      <div
+        className="pointer-events-none absolute -left-32 -top-32 h-[28rem] w-[28rem] rounded-full blur-3xl transition-colors duration-1000"
+        style={{ backgroundColor: nivel.color, opacity: oscuro ? 0.25 : 0.18 }}
+      />
+      <div
+        className="pointer-events-none absolute -bottom-40 -right-24 h-[32rem] w-[32rem] rounded-full blur-3xl transition-colors duration-1000"
+        style={{ backgroundColor: oscuro ? "#5E5CE6" : "#AF52DE", opacity: oscuro ? 0.2 : 0.12 }}
+      />
+
+      <DynamicIsland mensaje={toast.mensaje} visible={toast.visible} />
+
+      <div className="relative mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-10">
+        {/* ============ Ventana estilo macOS ============ */}
+        <div className={`${tarjeta} overflow-hidden`}>
+          {/* --- Barra de título --- */}
+          <header
+            className={`flex items-center gap-3 border-b px-4 py-3 sm:px-5 ${
+              oscuro ? "border-white/10" : "border-black/5"
+            }`}
+          >
+            {/* Controles decorativos: cerrar, minimizar, maximizar */}
+            <div className="flex gap-2">
+              <span className="h-3 w-3 rounded-full bg-[#FF5F57]" />
+              <span className="h-3 w-3 rounded-full bg-[#FEBC2E]" />
+              <span className="h-3 w-3 rounded-full bg-[#28C840]" />
+            </div>
+            <div className="flex min-w-0 flex-1 items-center justify-center gap-2">
+              <Lock size={14} className={textoSecundario} />
+              <h1 className={`truncate text-sm font-semibold ${textoPrincipal}`}>
+                ProtecClave — Auditor & Generador de Seguridad
+              </h1>
+            </div>
+            <button
+              onClick={() => setOscuro(!oscuro)}
+              className={`rounded-full p-2 transition-all active:scale-90 ${
+                oscuro ? "bg-white/10 text-white hover:bg-white/15" : "bg-black/5 text-[#1D1D1F] hover:bg-black/10"
+              }`}
+              aria-label="Cambiar tema claro/oscuro"
+            >
+              {oscuro ? <Sun size={15} /> : <Moon size={15} />}
+            </button>
+          </header>
+
+          {/* Aviso de privacidad */}
+          <div
+            className={`flex items-center justify-center gap-2 px-4 py-2 text-center text-xs ${
+              oscuro ? "bg-white/[0.03] text-white/50" : "bg-black/[0.02] text-[#86868B]"
+            }`}
+          >
+            <Info size={13} className="shrink-0" />
+            Procesamiento 100% local en memoria. Nunca envíes contraseñas reales.
+          </div>
+
+          {/* ============ Contenido ============ */}
+          <main className="grid gap-5 p-4 sm:p-6 lg:grid-cols-5">
+            {/* ---------- Panel izquierdo: modelo 3D ---------- */}
+            <section className={`${tarjeta} relative flex flex-col overflow-hidden lg:col-span-2`}>
+              <div className="flex items-center justify-between px-5 pt-5">
+                <span className={`text-xs font-medium uppercase tracking-widest ${textoSecundario}`}>
+                  Núcleo criptográfico
+                </span>
+                <span
+                  className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold text-white ${SPRING}`}
+                  style={{ backgroundColor: nivel.color }}
+                >
+                  <IconoNivel size={13} /> {nivel.etiqueta}
+                </span>
+              </div>
+
+              <div className="h-72 w-full sm:h-80 lg:h-auto lg:min-h-[26rem] lg:flex-1">
+                <Escena3D nivel={nivel} />
+              </div>
+
+              <div className="px-5 pb-5 text-center">
+                <div className={`text-5xl font-semibold tracking-tight tabular-nums ${textoPrincipal}`}>
+                  {porcentaje}
+                  <span className={`text-2xl ${textoSecundario}`}>%</span>
+                </div>
+                <p className={`mt-1 text-xs ${textoSecundario}`}>Arrastra el modelo para rotarlo</p>
+              </div>
+            </section>
+
+            {/* ---------- Panel derecho: auditoría ---------- */}
+            <section className="flex flex-col gap-5 lg:col-span-3">
+              {/* Campo de contraseña */}
+              <div className={`${tarjeta} p-5`}>
+                <label htmlFor="clave" className={`text-sm font-semibold ${textoPrincipal}`}>
+                  Contraseña a auditar
+                </label>
+
+                <div
+                  className={`mt-3 flex items-center gap-1 rounded-2xl border px-4 py-1 transition-all focus-within:ring-4 ${
+                    oscuro
+                      ? "border-white/10 bg-black/40 focus-within:ring-[#007AFF]/30"
+                      : "border-black/10 bg-white/80 focus-within:ring-[#007AFF]/20"
+                  }`}
+                >
+                  <input
+                    id="clave"
+                    type={mostrar ? "text" : "password"}
+                    value={clave}
+                    onChange={(e) => setClave(e.target.value)}
+                    placeholder="Escribe una contraseña de prueba…"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`min-w-0 flex-1 bg-transparent py-3 font-mono text-base outline-none ${textoPrincipal} placeholder:font-sans ${
+                      oscuro ? "placeholder:text-white/30" : "placeholder:text-[#86868B]/70"
+                    }`}
+                  />
+                  <button
+                    onClick={() => setMostrar(!mostrar)}
+                    className={`rounded-full p-2 transition active:scale-90 ${textoSecundario} hover:opacity-80`}
+                    aria-label={mostrar ? "Ocultar contraseña" : "Mostrar contraseña"}
+                  >
+                    {mostrar ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                  <button
+                    onClick={copiar}
+                    disabled={vacia}
+                    className={`rounded-full p-2 transition active:scale-90 disabled:opacity-30 ${textoSecundario} hover:opacity-80`}
+                    aria-label="Copiar al portapapeles"
+                  >
+                    <Copy size={18} />
+                  </button>
+                  <button
+                    onClick={() => setClave("")}
+                    disabled={vacia}
+                    className={`rounded-full p-2 transition active:scale-90 disabled:opacity-30 ${textoSecundario} hover:opacity-80`}
+                    aria-label="Limpiar"
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                </div>
+
+                {/* Barra de progreso animada */}
+                <div className="mt-4">
+                  <div className="mb-1.5 flex justify-between text-xs font-medium">
+                    <span className={textoSecundario}>Nivel de seguridad</span>
+                    <span style={{ color: nivel.color }} className="tabular-nums transition-colors duration-500">
+                      {porcentaje}%
+                    </span>
+                  </div>
+                  <div className={`h-2.5 w-full overflow-hidden rounded-full ${oscuro ? "bg-white/10" : "bg-black/5"}`}>
+                    <div
+                      className={`h-full rounded-full ${SPRING}`}
+                      style={{ width: `${porcentaje}%`, backgroundColor: nivel.color }}
+                    />
+                  </div>
+                </div>
+
+                {/* Ejemplos rápidos para la exposición */}
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <span className={`text-xs ${textoSecundario}`}>Ejemplos:</span>
+                  {EJEMPLOS.map((ej) => (
+                    <button
+                      key={ej}
+                      onClick={() => {
+                        setClave(ej);
+                        setMostrar(true);
+                      }}
+                      className={`${botonSecundario} px-3 py-1.5 font-mono text-xs`}
+                    >
+                      {ej}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Criterios + métricas */}
+              <div className="grid gap-5 md:grid-cols-2">
+                <div className={`${tarjeta} p-5`}>
+                  <h2 className={`mb-2 text-sm font-semibold ${textoPrincipal}`}>Criterios de seguridad</h2>
+                  <ul>
+                    {criterios.map((c) => (
+                      <Criterio key={c.id} texto={c.texto} cumple={c.cumple} vacia={vacia} oscuro={oscuro} />
+                    ))}
+                  </ul>
+                </div>
+
+                <div className={`${tarjeta} flex flex-col gap-3 p-5`}>
+                  <h2 className={`text-sm font-semibold ${textoPrincipal}`}>Métricas técnicas</h2>
+                  <Metrica
+                    icono={Cpu}
+                    titulo="Entropía"
+                    valor={`${entropia} bits`}
+                    subtitulo="longitud × log₂(alfabeto)"
+                    oscuro={oscuro}
+                  />
+                  <Metrica
+                    icono={Clock}
+                    titulo="Tiempo de descifrado"
+                    valor={tiempo}
+                    subtitulo="Fuerza bruta a 10¹⁰ intentos/seg"
+                    oscuro={oscuro}
+                  />
+                  <Metrica
+                    icono={Zap}
+                    titulo="Longitud"
+                    valor={`${clave.length} caracteres`}
+                    oscuro={oscuro}
+                  />
+                </div>
+              </div>
+
+              {/* Generador criptográfico */}
+              <div className={`${tarjeta} p-5`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h2 className={`text-sm font-semibold ${textoPrincipal}`}>Generador criptográfico</h2>
+                    <p className={`text-xs ${textoSecundario}`}>
+                      Usa <code className="font-mono">crypto.getRandomValues()</code> · equivalente a{" "}
+                      <code className="font-mono">secrets</code> de Python
+                    </p>
+                  </div>
+                  <Sparkles size={18} className="shrink-0 text-[#007AFF]" />
+                </div>
+
+                {/* Slider de longitud */}
+                <div className="mt-4">
+                  <div className="flex justify-between text-xs font-medium">
+                    <span className={textoSecundario}>Longitud</span>
+                    <span className={`tabular-nums ${textoPrincipal}`}>{longitud} caracteres</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={12}
+                    max={24}
+                    value={longitud}
+                    onChange={(e) => setLongitud(Number(e.target.value))}
+                    className="mt-2 w-full accent-[#007AFF]"
+                    aria-label="Longitud de la clave"
+                  />
+                </div>
+
+                {/* Opciones */}
+                <div className="mt-3 flex flex-wrap gap-4">
+                  {[
+                    { etiqueta: "Números (0-9)", valor: usarNumeros, cambiar: setUsarNumeros },
+                    { etiqueta: "Símbolos (!@#…)", valor: usarSimbolos, cambiar: setUsarSimbolos },
+                  ].map((op) => (
+                    <label key={op.etiqueta} className={`flex cursor-pointer items-center gap-2 text-sm ${textoPrincipal}`}>
+                      <input
+                        type="checkbox"
+                        checked={op.valor}
+                        onChange={(e) => op.cambiar(e.target.checked)}
+                        className="h-4 w-4 accent-[#007AFF]"
+                      />
+                      {op.etiqueta}
+                    </label>
+                  ))}
+                </div>
+                {(!usarNumeros || !usarSimbolos) && (
+                  <p className="mt-2 text-xs text-[#FF9500]">
+                    Sin números o símbolos la clave no cumplirá los 6 criterios.
+                  </p>
+                )}
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    onClick={generar}
+                    className="flex flex-1 items-center justify-center gap-2 rounded-full bg-[#007AFF] px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-[#007AFF]/25 transition-all hover:bg-[#0A84FF] active:scale-95"
+                  >
+                    <RefreshCw size={16} /> Generar clave segura
+                  </button>
+                  <button onClick={copiar} disabled={vacia} className={`${botonSecundario} py-3 disabled:opacity-40`}>
+                    <Copy size={15} /> Copiar
+                  </button>
+                </div>
+              </div>
+            </section>
+          </main>
+        </div>
+
+        <footer className={`mt-6 text-center text-xs ${textoSecundario}`}>
+          UNFV · Facultad de Ingeniería Industrial y de Sistemas · Tecnología de Información y Comunicación
+        </footer>
+      </div>
+    </div>
+  );
+}
